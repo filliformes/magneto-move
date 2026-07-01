@@ -55,7 +55,7 @@ It gives you **two sides of tape** (A = tracks 1‑2, B = tracks 3‑4, C‑1 st
 
 - An **Ableton Move** running **Schwung** (Move Everything). Magnéto uses Schwung's stock
   file‑browser, so no extra host patching is needed.
-- To capture external audio: the stock **Line In** module (ships with Schwung).
+- To capture external audio: the stock **Line In** module (ships with Schwung). Any sound generator will also work to record in the tape loops.
 
 ---
 
