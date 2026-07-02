@@ -147,7 +147,22 @@ The everyday controls. Knobs 1‑8:
 | 7 | **Tape** | Selects one of 9 tape models (see Tape Model page). |
 | 8 | **Volume** | Master output level. |
 
-*Menu‑only:* **Feedback** — overdub retention (0 % replace → 100 % sound‑on‑sound).
+*Menu‑only:*
+- **Feedback** — overdub retention (0 % replace → 100 % sound‑on‑sound).
+- **Sync Mode** — **Free** (Rec Length in seconds, the default) or **Sync** (loop length locked to bars/beats).
+- **Rec Length** — max length of a fresh take, 1–30 s (used in Free mode; duplicated from Recordings).
+- **Sync Div** — the musical loop length in Sync mode: 1 Beat · 2 Beats · 1 Bar · 2 Bars · **4 Bars** (default) · 8 Bars · 16 Bars.
+- **Tempo** — 20–999 BPM. Used as the sync tempo when no MIDI clock is present.
+
+**Tempo‑synced loops.** In **Sync** mode a fresh recording auto‑stops at exactly the chosen
+**Sync Div**, so the loop is a whole number of bars. When Move's **MIDI clock** is running
+(enable *MIDI Clock Out* in Move's settings), the take is **locked to the clock itself** — it
+counts clock ticks and closes on the exact beat, immune to tempo jitter or drift. With no
+clock, it falls back to the manual **Tempo** knob — set that to your project's BPM. Because a
+side holds 30 s, long divisions only fit at higher tempos: **2 Bars** always fits (any tempo
+down to 20 BPM), **4 Bars** needs ≥ 32 BPM, **8 Bars** ≥ 64 BPM, **16 Bars** ≥ 128 BPM;
+anything longer than 30 s is clamped to 30 s. Sync affects new takes only — overdubs keep the
+existing loop length.
 
 ### 2 · Perform
 
@@ -248,6 +263,8 @@ Sample I/O and rescue (menu‑only).
 - **Channel Mode = Tape** lets you EQ/pan/trim a loop **after** you recorded it.
 - **Everything that jumps is declicked** (Play/Stop, Side switch, Jump, Stutter, Scan, the loop
   seam) and the master output goes through a tape‑style **ClipOnly2** soft ceiling.
+- **Tape saturation is unity‑gain** — the drive stage is level‑compensated, so Saturation (and
+  the tape models) add colour and harmonics without pumping the volume up.
 
 ---
 

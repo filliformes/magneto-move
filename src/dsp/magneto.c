@@ -68,7 +68,7 @@ static int g_next_instance = 1;   /* hands each instance an M-number for exporte
 #define XFADE_LEN       512                   /* ~11.6 ms click-free side crossfade */
 #define POS_XFADE_LEN   882                   /* ~20 ms scan micro-loop crossfade */
 #define JUMP_XFADE      300                   /* ~7 ms declick for Jump/Stutter position jumps */
-#define SCAN_MIN_WIN    4000                  /* min micro-loop window (≫ crossfade → no buzz) */
+#define SCAN_MIN_WIN    8000                  /* min micro-loop window (≥ crossfade even at 8× wind → no buzz) */
 #define JOG_CHASE       0.0006                /* Scrub jog: slow chase → smooth mid-range pitch */
 #define JOG_VEL_CAP     8.0                   /* Scrub jog: max playback speed (×3 oct) */
 #define PLAY_GAIN_COEFF 0.0022f               /* ~10 ms loop fade on Play/Stop (declick) */
@@ -95,6 +95,16 @@ static const char *EQIN_NAMES[NUM_EQIN] = { "Input", "Tape", "Off" };
 
 #define NUM_RECMODE 2
 static const char *RECMODE_NAMES[NUM_RECMODE] = { "Monitor", "Loop Only" };
+
+/* Sync mode: tempo-synced loop lengths. In Sync, Rec Length becomes a musical division;
+ * the fresh take auto-stops at exactly DIV_BEATS beats at the effective tempo. */
+#define NUM_DIV 7
+static const char  *DIV_NAMES[NUM_DIV] = { "1 Beat", "2 Beats", "1 Bar", "2 Bars", "4 Bars", "8 Bars", "16 Bars" };
+static const double DIV_BEATS[NUM_DIV] = { 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0 };
+#define DEFAULT_SYNC_DIV 4                 /* 4 Bars */
+#define SYNC_DEFAULT_BPM 120
+#define CLK_PPQN         24                /* MIDI clock ticks per quarter note */
+#define CLK_STALE_FRAMES (SR / 2)          /* no tick for ~0.5 s → clock stopped, fall back to manual */
 
 #define NUM_SIDE_OPT 2
 static const char *SIDE_NAMES[NUM_SIDE_OPT] = { "A 1-2", "B 3-4" };
@@ -356,6 +366,23 @@ typedef struct {
     int    fail_count;      /* samples left in the current play/mute span */
     int    fail_state;      /* 0 = playing, 1 = muted */
     float  fail_gain;       /* smoothed gate gain (click-free) */
+
+    /* Sync mode (tempo-synced loop lengths) */
+    int      sync_mode;     /* 0 = Free (Rec Length in seconds), 1 = Sync (bars/beats) */
+    int      sync_div;      /* division index into DIV_BEATS[] */
+    int      tempo_bpm;     /* manual tempo 20..999 — used when no MIDI clock is present */
+    /* MIDI-clock tempo measurement (0xF8 ticks, 24 PPQN) */
+    uint64_t clk_frame;         /* free-running sample counter (advanced each block) */
+    uint64_t clk_last_tick;     /* clk_frame at the previous 0xF8 tick */
+    uint64_t clk_last_activity; /* clk_frame at the last clock message (staleness) */
+    double   clk_interval;      /* smoothed samples/tick (block-jitter averaged) */
+    double   clk_bpm;           /* measured BPM, valid while clock is live */
+    /* Tick-locked recording: when clock is live at record-start, a fresh Sync take stops
+     * after exactly rec_target_ticks 0xF8 ticks — locked to the clock grid, not a measured
+     * length (immune to BPM jitter / tempo drift, like the arp's clock-counted stepping). */
+    int      rec_tick_lock;     /* 1 = this take is counting clock ticks */
+    int      rec_tick_count;    /* ticks received since record-start */
+    int      rec_target_ticks;  /* division beats × 24 PPQN */
 
     char module_dir[512];
 } plugin_instance_t;
@@ -732,6 +759,11 @@ static void *create_instance(const char *module_dir, const char *config_json) {
     p->high = 0.0f; p->high_freq = 10000.0f; p->chan_vol = 1.0f;          /* 0 dB, 10 kHz */
     p->eq_in = 0;       /* EQ on Input */
     p->rec_mode = 0;    /* Monitor (external audio always audible) */
+    p->sync_mode = 0;   /* Free (Rec Length in seconds) */
+    p->sync_div = DEFAULT_SYNC_DIV; p->tempo_bpm = SYNC_DEFAULT_BPM;
+    p->clk_frame = 0; p->clk_last_tick = 0; p->clk_last_activity = 0;
+    p->clk_interval = 0.0; p->clk_bpm = 0.0;
+    p->rec_tick_lock = 0; p->rec_tick_count = 0; p->rec_target_ticks = 0;
     /* seed the 20 ms smoothing companions so they don't glide from 0 on load */
     p->sm_trim = p->trim; p->sm_low = p->low; p->sm_mid = p->mid; p->sm_mid_freq = p->mid_freq;
     p->sm_high = p->high; p->sm_high_freq = p->high_freq; p->sm_input_pan = p->input_pan; p->sm_chan_vol = p->chan_vol;
@@ -770,6 +802,12 @@ static void destroy_instance(void *instance) {
 }
 
 /* ── Transport ───────────────────────────────────────────────────────────────────── */
+/* Clock is "live" when we have a measured BPM and a tick arrived within the last ~0.5 s. */
+static int clock_is_live(const plugin_instance_t *p) {
+    return (p->clk_bpm >= 20.0) &&
+           ((p->clk_frame - p->clk_last_activity) < (uint64_t)CLK_STALE_FRAMES);
+}
+
 static void toggle_play(plugin_instance_t *p) {
     if (p->play) { p->play = 0; p->rec = 0; } else { p->play = 1; }
 }
@@ -777,7 +815,17 @@ static void toggle_record(plugin_instance_t *p) {
     int s = clampi(p->side, 0, NUM_SIDES - 1);
     if (!p->rec) {
         p->rec = 1;
-        if (p->loop_len[s] == 0) { p->write_pos = 0; p->play = 0; }
+        p->rec_tick_lock = 0;
+        if (p->loop_len[s] == 0) {
+            p->write_pos = 0; p->play = 0;
+            /* Sync + live clock → lock this take to an exact number of clock ticks. */
+            if (p->sync_mode && clock_is_live(p)) {
+                int di = clampi(p->sync_div, 0, NUM_DIV - 1);
+                p->rec_target_ticks = (int)(DIV_BEATS[di] * (double)CLK_PPQN + 0.5);
+                p->rec_tick_count = 0;
+                p->rec_tick_lock  = 1;
+            }
+        }
         else { p->play = 1; p->write_pos = (int)p->play_pos % p->loop_len[s]; }
     } else {
         if (p->loop_len[s] == 0) {
@@ -786,6 +834,7 @@ static void toggle_record(plugin_instance_t *p) {
             p->play = (p->loop_len[s] > 0) ? 1 : 0;
         }
         p->rec = 0;
+        p->rec_tick_lock = 0;
         save_loops(p);   /* persist the finished take immediately (not the audio thread) */
     }
 }
@@ -794,8 +843,35 @@ __attribute__((visibility("default")))
 void move_audio_fx_on_midi(void *instance, const uint8_t *msg, int len, int source) {
     (void)source;
     plugin_instance_t *p = (plugin_instance_t *)instance;
-    if (!p || !msg || len < 3) return;
-    if ((msg[0] & 0xF0) != 0xB0) return;   /* CC only */
+    if (!p || !msg || len < 1) return;
+
+    /* MIDI real-time clock → measure tempo for Sync mode (24 ticks per quarter note).
+     * Intervals are timed in samples via the block-advanced clk_frame counter, then
+     * smoothed to average out the ~128-sample block quantization of MIDI delivery. */
+    uint8_t st = msg[0];
+    if (st == 0xF8) {                               /* clock tick */
+        uint64_t now = p->clk_frame;
+        if (p->clk_last_tick != 0) {
+            double iv = (double)(now - p->clk_last_tick);
+            if (iv > 4.0 && iv < (double)SR) {      /* plausible tick spacing */
+                if (p->clk_interval <= 0.0) p->clk_interval = iv;
+                else                        p->clk_interval += 0.15 * (iv - p->clk_interval);
+                double bpm = 60.0 * (double)SR / (p->clk_interval * (double)CLK_PPQN);
+                if (bpm >= 20.0 && bpm <= 999.0) p->clk_bpm = bpm;
+            }
+        }
+        if (p->rec && p->rec_tick_lock) p->rec_tick_count++;   /* tick-locked take */
+        p->clk_last_tick = now;
+        p->clk_last_activity = now;
+        return;
+    }
+    if (st == 0xFA || st == 0xFB) {                 /* start / continue: re-arm measurement */
+        p->clk_last_tick = 0; p->clk_interval = 0.0; p->clk_last_activity = p->clk_frame; return;
+    }
+    if (st == 0xFC) { return; }                     /* stop: let it go stale → manual fallback */
+
+    if (len < 3) return;
+    if ((st & 0xF0) != 0xB0) return;   /* CC only */
     uint8_t cc = msg[1], val = msg[2];
     if (cc == CC_PLAY && val >= 64)             toggle_play(p);
     else if (cc == CC_RECORD && val >= 64)      toggle_record(p);
@@ -809,7 +885,7 @@ void move_audio_fx_on_midi(void *instance, const uint8_t *msg, int len, int sour
 /* ── Audio ─────────────────────────────────────────────────────────────────────────── */
 /* Per-block tape-coloration coefficients (shared by the loop path and the live monitor). */
 typedef struct {
-    float sat_drive, roll_coeff, hp_coeff, hiss_amt, noise_color, ncol_coeff;
+    float sat_drive, sat_makeup, roll_coeff, hp_coeff, hiss_amt, noise_color, ncol_coeff;
     float mb0, mb1, mb2, ma1, ma2;   /* baked per-model midrange peaking EQ */
     float tone_coeff, tone_hi, tone_lo;   /* post-tape Tone tilt */
 } tape_color_t;
@@ -818,8 +894,10 @@ typedef struct {
  * path's filter state (tape_main for the loop, tape_mon for the input monitor). */
 static inline void apply_tape_color(tape_state_t *t, const tape_color_t *c, uint32_t *rng, float *wl, float *wr) {
     float l = *wl, r = *wr;
-    l = tape_soft_clip(l * c->sat_drive);
-    r = tape_soft_clip(r * c->sat_drive);
+    /* Drive into the soft clip, then makeup back to ~unity small-signal gain so the tape
+     * stage colours the signal without pumping it +6 dB (was making the input run hot). */
+    l = tape_soft_clip(l * c->sat_drive) * c->sat_makeup;
+    r = tape_soft_clip(r * c->sat_drive) * c->sat_makeup;
     l = biquad(l, c->mb0, c->mb1, c->mb2, c->ma1, c->ma2, &t->mid_z1_l, &t->mid_z2_l);
     r = biquad(r, c->mb0, c->mb1, c->mb2, c->ma1, c->ma2, &t->mid_z1_r, &t->mid_z2_r);
     t->lp_l += c->roll_coeff * (l - t->lp_l) + DENORM;
@@ -876,6 +954,8 @@ static void process_block(void *instance, int16_t *buf, int frames) {
     if (!p || frames <= 0) return;
     if (frames > MAX_BLOCK) frames = MAX_BLOCK;
 
+    p->clk_frame += (uint64_t)frames;   /* sample clock for MIDI-tempo measurement */
+
     const int s = clampi(p->side, 0, NUM_SIDES - 1);
     /* Side change → kick off a short click-free crossfade from the previous side. */
     if (s != p->render_side) {
@@ -902,7 +982,20 @@ static void process_block(void *instance, int16_t *buf, int frames) {
     float  stop_ms = clampf(p->stop_speed, 60.0f, 10000.0f);
     double ts_inc  = 1.0 / ((double)stop_ms * 0.001 * (double)SR);
     double ts_targ = p->tape_stop ? 0.0 : 1.0;
-    int    rec_frames = (int)(clampf(p->rec_length, 1.0f, (float)MAX_LOOP_SEC) * (float)SR);
+    /* Fresh-take length: Free = seconds; Sync = musical division at the effective tempo
+     * (live MIDI clock if ticks are flowing, else the manual Tempo knob), capped to buffer. */
+    int rec_frames;
+    if (p->sync_mode) {
+        int di = clampi(p->sync_div, 0, NUM_DIV - 1);
+        double bpm  = clock_is_live(p) ? p->clk_bpm : (double)clampi(p->tempo_bpm, 20, 999);
+        double secs = DIV_BEATS[di] * 60.0 / bpm;
+        long   f    = (long)(secs * (double)SR + 0.5);
+        if (f > MAX_FRAMES) f = MAX_FRAMES;   /* longer than the buffer → clamp (loop not whole-bar) */
+        if (f < 1)          f = 1;
+        rec_frames = (int)f;
+    } else {
+        rec_frames = (int)(clampf(p->rec_length, 1.0f, (float)MAX_LOOP_SEC) * (float)SR);
+    }
     if (rec_frames > MAX_FRAMES) rec_frames = MAX_FRAMES;
 
     /* jog scrub (bonus CC path) */
@@ -936,6 +1029,7 @@ static void process_block(void *instance, int16_t *buf, int frames) {
     float lc_amt  = clampf(p->lowcut + g * 0.40f, 0.0f, 1.0f);
     tc.hp_coeff   = 1.0f - expf(-6.2831853f * (20.0f + lc_amt * 780.0f) / (float)SR);
     tc.sat_drive  = 1.0f + (p->saturation + g * 0.25f) * 3.0f;
+    tc.sat_makeup = 1.0f / tc.sat_drive;      /* unity small-signal gain (colour without level boost) */
     tc.hiss_amt   = clampf(p->hiss + g * 0.05f, 0.0f, 1.0f) * 0.01f;
     tc.ncol_coeff = 1.0f - expf(-6.2831853f * 3000.0f / (float)SR);
     const tape_model_t *tm = &MODELS[clampi(p->model, 0, NUM_MODEL - 1)];
@@ -984,6 +1078,11 @@ static void process_block(void *instance, int16_t *buf, int frames) {
     if (scan_win < (double)SCAN_MIN_WIN) scan_win = (double)SCAN_MIN_WIN;  /* keep micro-loop musical */
     if (scan_win > (double)llen)         scan_win = (double)llen;
     double scan_base = (double)llen * (0.5 + 0.49 * (double)scan_amt);
+    /* Keep the whole scan window INSIDE the buffer. Without this, at high scan the
+     * window straddles the loop end and the 2nd playhead reads across the raw seam
+     * (end→start) with no crossfade → the buzz/distortion that worsens past ~80%. */
+    if (scan_base + scan_win > (double)llen) scan_base = (double)llen - scan_win;
+    if (scan_base < 0.0) scan_base = 0.0;
 
     /* Scrub = turntable jog: moving the knob sets a target + a ~0.3 s active window; the
      * playhead then *chases* the target continuously (smooth, pitch follows turn speed). */
@@ -1177,11 +1276,19 @@ static void process_block(void *instance, int16_t *buf, int frames) {
         /* ── Record / overdub ── */
         if (p->rec && lp) {
             if (llen == 0) {                       /* fresh take: clean conditioned input */
-                if (p->write_pos < rec_frames) {
+                /* Stop on the tick count when clock-locked, else on the sample length.
+                 * MAX_FRAMES is the hard buffer cap (also catches a locked take whose
+                 * clock stalls mid-record — it finalizes at 30 s instead of hanging). */
+                int stop = p->rec_tick_lock ? (p->rec_tick_count >= p->rec_target_ticks)
+                                            : (p->write_pos >= rec_frames);
+                if (!stop && p->write_pos < MAX_FRAMES) {
                     lp[p->write_pos * 2]     = f2i16(cond_l);
                     lp[p->write_pos * 2 + 1] = f2i16(cond_r);
                     p->write_pos++;
-                } else { p->loop_len[s] = (p->write_pos > 0) ? p->write_pos : 0; p->rec = 0; p->play = 1; p->play_pos = 0.0; }
+                } else {
+                    p->loop_len[s] = (p->write_pos > 0) ? p->write_pos : 0;
+                    p->rec = 0; p->play = 1; p->play_pos = 0.0; p->rec_tick_lock = 0;
+                }
             } else {
                 /* Overdub = classic sound-on-sound: retain the RAW old loop (at the write head,
                  * aligned, no wow/flutter, no tape colour) × Feedback, then add the new input.
@@ -1353,6 +1460,16 @@ static void set_param(void *instance, const char *key, const char *val) {
         for (int i = 0; i < NUM_RECMODE; i++) if (!strcmp(val, RECMODE_NAMES[i])) { p->rec_mode = i; return; }
         p->rec_mode = clampi(atoi(val), 0, NUM_RECMODE - 1); return;
     }
+    if (!strcmp(key, "sync_mode")) {
+        if (!strcmp(val, "Free")) { p->sync_mode = 0; return; }
+        if (!strcmp(val, "Sync")) { p->sync_mode = 1; return; }
+        p->sync_mode = clampi(atoi(val), 0, 1); return;
+    }
+    if (!strcmp(key, "sync_div")) {
+        for (int i = 0; i < NUM_DIV; i++) if (!strcmp(val, DIV_NAMES[i])) { p->sync_div = i; return; }
+        p->sync_div = clampi(atoi(val), 0, NUM_DIV - 1); return;
+    }
+    if (!strcmp(key, "tempo")) { p->tempo_bpm = clampi(atoi(val), 20, 999); return; }
 
     /* real-unit params (dB / Hz / ms / sec) — clamp to their own ranges before the 0..1 catch-all */
     if (!strcmp(key, "trim"))       { p->trim       = clampf((float)atof(val), -12.0f, 12.0f);   return; }
@@ -1397,6 +1514,9 @@ static void set_param(void *instance, const char *key, const char *val) {
           if ((q = strstr(val, "rec_length="))  ) p->rec_length  = clampf((float)atof(q + 11), 1.0f, (float)MAX_LOOP_SEC);
           if ((q = strstr(val, "eq_in="))       ) p->eq_in       = clampi(atoi(q + 6), 0, NUM_EQIN - 1);
           if ((q = strstr(val, "rec_mode="))    ) p->rec_mode    = clampi(atoi(q + 9), 0, NUM_RECMODE - 1);
+          if ((q = strstr(val, "sync_mode="))   ) p->sync_mode   = clampi(atoi(q + 10), 0, 1);
+          if ((q = strstr(val, "sync_div="))    ) p->sync_div    = clampi(atoi(q + 9), 0, NUM_DIV - 1);
+          if ((q = strstr(val, "tempo="))       ) p->tempo_bpm   = clampi(atoi(q + 6), 20, 999);
         }
         p->pan_mode = clampi(pm, 0, NUM_PANMODE - 1);
 
@@ -1422,57 +1542,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
 
     if (!strcmp(key, "name")) return snprintf(buf, buf_len, "Magneto");
 
-    if (!strcmp(key, "chain_params")) {
-        return snprintf(buf, buf_len,
-            "["
-            "{\"key\":\"varspeed\",\"name\":\"Var Speed\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"speed\",\"name\":\"Speed\",\"type\":\"enum\",\"options\":[\"1 7/8\",\"15/16\"]},"
-            "{\"key\":\"side\",\"name\":\"Side\",\"type\":\"enum\",\"options\":[\"A 1-2\",\"B 3-4\"]},"
-            "{\"key\":\"tone\",\"name\":\"Tone\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"volume\",\"name\":\"Volume\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"model\",\"name\":\"Tape\",\"type\":\"enum\",\"options\":[\"Type I\",\"Type II\",\"Type IV\",\"Worn\",\"Radio\",\"VCR\",\"Dictaphone\",\"Microcass\",\"Studio\"]},"
-            "{\"key\":\"mix\",\"name\":\"Mix\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"feedback\",\"name\":\"Feedback\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"wow\",\"name\":\"Wow\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"flutter\",\"name\":\"Flutter\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"saturation\",\"name\":\"Saturation\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"rolloff\",\"name\":\"HF Rolloff\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"hiss\",\"name\":\"Hiss\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"lowcut\",\"name\":\"Low Cut\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"generations\",\"name\":\"Generations\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"input_pan\",\"name\":\"Pan\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"pan_mode\",\"name\":\"Pan Mode\",\"type\":\"enum\",\"options\":[\"Mono\",\"Stereo\"]},"
-            "{\"key\":\"stutter\",\"name\":\"Stutter\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"failure\",\"name\":\"Failure\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"scrub\",\"name\":\"Scrub\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"jump\",\"name\":\"Jump\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01,\"unit\":\"%%\"},"
-            "{\"key\":\"scan\",\"name\":\"Scan\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01,\"unit\":\"%%\"},"
-            "{\"key\":\"tape_stop\",\"name\":\"Tape Stop\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
-            "{\"key\":\"stop_speed\",\"name\":\"Stop Speed\",\"type\":\"float\",\"min\":60,\"max\":10000,\"step\":50,\"unit\":\"ms\"},"
-            "{\"key\":\"trim\",\"name\":\"Trim\",\"type\":\"float\",\"min\":-12,\"max\":12,\"step\":0.5,\"unit\":\"dB\"},"
-            "{\"key\":\"low\",\"name\":\"Low\",\"type\":\"float\",\"min\":-12,\"max\":12,\"step\":0.5,\"unit\":\"dB\"},"
-            "{\"key\":\"mid\",\"name\":\"Mid\",\"type\":\"float\",\"min\":-12,\"max\":12,\"step\":0.5,\"unit\":\"dB\"},"
-            "{\"key\":\"mid_freq\",\"name\":\"Mid Freq\",\"type\":\"float\",\"min\":250,\"max\":5000,\"step\":25,\"unit\":\"Hz\"},"
-            "{\"key\":\"high\",\"name\":\"High\",\"type\":\"float\",\"min\":-12,\"max\":12,\"step\":0.5,\"unit\":\"dB\"},"
-            "{\"key\":\"high_freq\",\"name\":\"High Freq\",\"type\":\"float\",\"min\":5000,\"max\":12000,\"step\":50,\"unit\":\"Hz\"},"
-            "{\"key\":\"chan_vol\",\"name\":\"Volume\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01,\"unit\":\"%%\"},"
-            "{\"key\":\"eq_in\",\"name\":\"Channel Mode\",\"type\":\"enum\",\"options\":[\"Input\",\"Tape\",\"Off\"]},"
-            "{\"key\":\"rec_mode\",\"name\":\"Rec Mode\",\"type\":\"enum\",\"options\":[\"Monitor\",\"Loop Only\"]},"
-            "{\"key\":\"rec_length\",\"name\":\"Rec Length\",\"type\":\"float\",\"min\":1,\"max\":30,\"step\":1,\"unit\":\"sec\"},"
-            "{\"key\":\"fwd\",\"name\":\"Fwd\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
-            "{\"key\":\"bwd\",\"name\":\"Bwd\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
-            "{\"key\":\"load_a\",\"name\":\"Load A\",\"type\":\"filepath\",\"root\":\"/data/UserData/UserLibrary\",\"filter\":\".wav\",\"live_preview\":true,\"default\":\"\"},"
-            "{\"key\":\"load_b\",\"name\":\"Load B\",\"type\":\"filepath\",\"root\":\"/data/UserData/UserLibrary\",\"filter\":\".wav\",\"live_preview\":true,\"default\":\"\"},"
-            "{\"key\":\"blank_a\",\"name\":\"Blank A\",\"type\":\"enum\",\"options\":[\"Blank\",\"Blanked\"]},"
-            "{\"key\":\"blank_b\",\"name\":\"Blank B\",\"type\":\"enum\",\"options\":[\"Blank\",\"Blanked\"]},"
-            "{\"key\":\"save_recs\",\"name\":\"Save to Recs\",\"type\":\"enum\",\"options\":[\"Save\",\"Saved\"]},"
-            "{\"key\":\"play\",\"name\":\"Play\",\"type\":\"enum\",\"options\":[\"Stopped\",\"Playing\"]},"
-            "{\"key\":\"rec\",\"name\":\"Rec\",\"type\":\"enum\",\"options\":[\"Stopped\",\"Rec\"]},"
-            "{\"key\":\"reverse\",\"name\":\"Reverse\",\"type\":\"enum\",\"options\":[\"Fwd\",\"Rev\"]},"
-            "{\"key\":\"clear\",\"name\":\"Clear\",\"type\":\"enum\",\"options\":[\"Clear\",\"Cleared\"]},"
-            "{\"key\":\"recover\",\"name\":\"Recover Loop\",\"type\":\"enum\",\"options\":[\"Recover\",\"Recovered\"]}"
-            "]");
-    }
+    if (!strcmp(key, "chain_params")) return -1;  /* JSON exceeds ~4KB shim buffer; host reads the full chain_params from module.json */
 
     if (!strcmp(key, "speed")) return snprintf(buf, buf_len, "%s", SPEED_NAMES[clampi(p->speed_mode,0,NUM_SPEED-1)]);
     if (!strcmp(key, "side"))  return snprintf(buf, buf_len, "%s", SIDE_NAMES[clampi(p->side,0,NUM_SIDE_OPT-1)]);
@@ -1480,6 +1550,9 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     if (!strcmp(key, "pan_mode")) return snprintf(buf, buf_len, "%s", PANMODE_NAMES[clampi(p->pan_mode,0,NUM_PANMODE-1)]);
     if (!strcmp(key, "eq_in"))    return snprintf(buf, buf_len, "%s", EQIN_NAMES[clampi(p->eq_in,0,NUM_EQIN-1)]);
     if (!strcmp(key, "rec_mode")) return snprintf(buf, buf_len, "%s", RECMODE_NAMES[clampi(p->rec_mode,0,NUM_RECMODE-1)]);
+    if (!strcmp(key, "sync_mode")) return snprintf(buf, buf_len, "%s", p->sync_mode ? "Sync" : "Free");
+    if (!strcmp(key, "sync_div"))  return snprintf(buf, buf_len, "%s", DIV_NAMES[clampi(p->sync_div,0,NUM_DIV-1)]);
+    if (!strcmp(key, "tempo"))     return snprintf(buf, buf_len, "%d", clampi(p->tempo_bpm,20,999));
 
     /* transport menu triggers — reflect live state so the menu stays in sync */
     if (!strcmp(key, "play"))    return snprintf(buf, buf_len, "%s", p->play ? "Playing" : "Stopped");
@@ -1547,12 +1620,14 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
             "wow=%.6f;flutter=%.6f;saturation=%.6f;rolloff=%.6f;hiss=%.6f;"
             "lowcut=%.6f;generations=%.6f;input_pan=%.6f;pan_mode=%d;stutter=%.6f;failure=%.6f;"
             "trim=%.6f;low=%.6f;mid=%.6f;mid_freq=%.6f;high=%.6f;high_freq=%.6f;chan_vol=%.6f;"
-            "jump=%.6f;scan=%.6f;stop_speed=%.6f;rec_length=%.6f;eq_in=%d;rec_mode=%d;id=%s",
+            "jump=%.6f;scan=%.6f;stop_speed=%.6f;rec_length=%.6f;eq_in=%d;rec_mode=%d;"
+            "sync_mode=%d;sync_div=%d;tempo=%d;id=%s",
             p->varspeed, p->speed_mode, p->side, p->tone, p->volume, p->model, p->mix, p->feedback,
             p->wow, p->flutter, p->saturation, p->rolloff, p->hiss,
             p->lowcut, p->generations, p->input_pan, p->pan_mode, p->stutter, p->failure,
             p->trim, p->low, p->mid, p->mid_freq, p->high, p->high_freq, p->chan_vol,
-            p->jump, p->scan, p->stop_speed, p->rec_length, p->eq_in, p->rec_mode, p->loop_id);
+            p->jump, p->scan, p->stop_speed, p->rec_length, p->eq_in, p->rec_mode,
+            p->sync_mode, p->sync_div, p->tempo_bpm, p->loop_id);
     }
 
     return -1;   /* unknown key — MUST be -1, not 0 */

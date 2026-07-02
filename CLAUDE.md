@@ -25,7 +25,27 @@ the stock **Line In (LI)** sound generator in the synth slot upstream (Input Mod
 
 Page 0 — **Magneto** (knobs 1-8): **play**, **rec**, varspeed(±2 oct, 0.25x..4.0x),
 speed(1 7/8·15/16), side(A·B), tone(post-tape C-1 tilt), model(9 tape models), volume.
-`feedback` menu-only.
+Menu-only: `feedback`; **sync_mode**(Free/Sync), **rec_length**(dup from Recordings, 1..30 s,
+Free only), **sync_div**(1 Beat..16 Bars, default 4 Bars, Sync only), **tempo**(20..999 BPM,
+manual fallback). **Sync mode** = tempo-synced loop length: a fresh take auto-stops at exactly
+`sync_div` beats. **Two sync paths** (like arp/Genera):
+ 1. **Tick-locked (primary, exact):** if MIDI clock is live at record-start, the take counts
+    0xF8 ticks and stops after `rec_target_ticks = beats × 24` — locked to the clock grid,
+    immune to BPM-measurement jitter and tempo drift. `rec_tick_lock`/`rec_tick_count` in
+    `toggle_record` (arm) + `on_midi` (count) + record block (stop). Hard-capped at MAX_FRAMES
+    so a mid-record clock stall finalizes at 30 s instead of hanging.
+ 2. **Sample-length fallback:** no clock → `rec_frames = beats × 60/tempo × SR` from the manual
+    **tempo** knob, capped to MAX_LOOP_SEC.
+`clk_bpm` (measured in `on_midi` by timing samples between ticks, smoothed) drives the fallback
+display; `clock_is_live()` = have BPM + a tick within ~0.5 s. Divisions & buffer math: 2 Bars is
+the largest that always fits at any tempo 20–999 (24 s @ 20 BPM); 4 Bars needs ≥32 BPM, 8 Bars
+≥64, 16 Bars ≥128; 1 Beat is the clean minimum. Sync affects fresh takes only, not overdubs.
+TEMPO REALITY (corrected): Schwung exposes tempo to plugins the same way for MIDI FX and audio
+FX — **not** as a host BPM number (`host_api_v1_t` has none; `get_clock_status()` is transport
+state only: UNAVAIL/STOPPED/RUNNING), but as **MIDI clock** the plugin locks to itself. Requires
+Move's "MIDI Clock Out" enabled + transport running (same requirement arp surfaces via its
+"Enable MIDI Clock Out in Move settings" warning). This is a fully supported sync path, not a
+limitation — the manual Tempo knob is just the no-clock fallback.
 
 Page 1 — **Perform** (knobs 1-8): scrub, **jump**, **scan**, reverse, stutter, failure,
 **tape_stop**(On/Off), **stop_speed**(60..3000 ms). jump = random playhead jumps, segment
@@ -53,7 +73,10 @@ Input → **channel strip** (trim → [EQ if `eq_in`=Input] → chan_vol → pan
 **recorded** signal + the monitor source). Two separate tape-color paths: `tape_main` (loop)
 and `tape_mon` (input monitor), each its own `tape_state_t` (so both can colour at once).
 `apply_tape_color` = sat→model EQ→rolloff→lowcut→**hiss(×0.01)**; then `apply_tone` (post-tape
-C-1 tilt around 1 kHz, so **hiss brightness follows Tone**).
+C-1 tilt around 1 kHz, so **hiss brightness follows Tone**). The sat stage carries a **makeup**
+`sat_makeup = 1/sat_drive` after the soft clip → **unity small-signal gain** (it colours without
+a level boost). Before this, `sat_drive`≈2× at defaults meant the monitored input ran ~+6 dB
+hot when inserted over live audio — the makeup fixes that; the tape voice/EQ is unchanged.
 **Rec Mode** (`rec_mode`, default **Monitor**): while playing, input is always monitored
 (`mon`) through tape+EQ and the loop plays on top at **Mix = loop level** — external audio is
 always audible. **Loop Only** = equal-power Mix(raw dry, wet); Mix 0 = raw clean, Mix 100 =
@@ -64,7 +87,11 @@ via `channel_strip()`) — Input (on `cond`, recorded) · Tape (on the played lo
 *chases* the target (`JOG_CHASE`, capped `JOG_VEL_CAP`=16×) — smooth, continuous, pitch follows
 turn speed, plays even when stopped.
 **Fwd/Bwd** wind up over ~3-4 s (`rate_coeff` 0.00002 while winding, else 0.0025).
-**Scan** micro-loop floored at `SCAN_MIN_WIN`=4000 (≫ crossfade → no single-cycle buzz).
+**Scan** micro-loop floored at `SCAN_MIN_WIN`=8000 (≥ crossfade even at 8× wind → no buzz);
+the window `[scan_base, scan_base+scan_win]` is clamped fully inside the buffer
+(`scan_base = min(scan_base, llen−scan_win)`) so the 2nd playhead never reads across the raw
+loop seam without a crossfade — that un-crossfaded seam read was the distortion that worsened
+past ~80% scan.
 **Jump/Stutter** position jumps get a ~7 ms declick crossfade (`xj_pos`/`xj_count`).
 **Loop seam:** ~20 ms equal-power crossfade-loop (end faded into start) near the wrap so the
 loop point doesn't click (forward playback; standard overlap = loop effectively −20 ms).
@@ -90,8 +117,15 @@ but the module is fully operable from the Deck menu without any MIDI.
 - `"audio_in": true` in capabilities — **required** or the module may silently fail to
   load (confirmed Deforme). `"midi_in": true` for transport CCs.
 - NO non-standard root fields (license/source_url) — host JSON parser may reject.
-- ui_hierarchy in module.json ONLY; DSP returns chain_params + knob_N_* + handles `_level`.
-- chain_params lists ALL params from ALL pages; clean `name`s (page gives context).
+- ui_hierarchy in module.json ONLY; DSP handles knob_N_* + `_level`. **`chain_params` now
+  lives in module.json ONLY** — DSP `get_param("chain_params")` returns **-1** so the host reads
+  it from module.json. The old inlined DSP JSON was **~4.1 KB, over the ~4 KB shim buffer**
+  (LESSON B): it truncated when the 3 Sync params were added, and the host's fallback
+  (`getParamMetadata`→`key.replace(/_/g," ")`) rendered missing keys as **lowercased keys**
+  ("sync_mode"→"sync mode"). Fix = -1 fallback; module.json is the single source of truth.
+- chain_params lists ALL params from ALL pages (module.json), clean `name`s (page gives context).
+  Any new param MUST be added to module.json chain_params or its menu label shows as a
+  lowercased key.
 - Init symbol MUST be `move_audio_fx_init_v2`; on_midi also exported (`move_audio_fx_on_midi`).
 - get_param returns **-1** for unknown keys (not 0); enums return name strings.
 - Page-aware knob overlay: `_level` updates current_page; KNOB_MAP (Main) / KNOB_MAP_P2
