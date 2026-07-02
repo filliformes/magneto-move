@@ -2,7 +2,7 @@
     "id": "magneto",
     "name": "Magneto",
     "abbrev": "MAGNTO",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Stereo cassette/tape looper + recorder inspired by the LoC C1 and Tascam Portastudio",
     "author": "Filliformes",
     "dsp": "magneto.so",
