@@ -2,7 +2,7 @@
     "id": "magneto",
     "name": "Magneto",
     "abbrev": "MAGNTO",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Stereo cassette/tape looper + recorder inspired by the LoC C1 and Tascam Portastudio",
     "author": "Filliformes",
     "dsp": "magneto.so",
@@ -40,7 +40,11 @@
                         { "key": "tone",     "label": "Tone",      "type": "float", "min": 0, "max": 1, "default": 0.5, "step": 0.01 },
                         { "key": "model",    "label": "Tape",      "type": "enum",  "options": ["Type I", "Type II", "Type IV", "Worn", "Radio", "VCR", "Dictaphone", "Microcass", "Studio"], "default": 0 },
                         { "key": "volume",   "label": "Volume",    "type": "float", "min": 0, "max": 1, "default": 0.8, "step": 0.01 },
-                        { "key": "feedback", "label": "Feedback",  "type": "float", "min": 0, "max": 1, "default": 0.5, "step": 0.01 }
+                        { "key": "feedback", "label": "Feedback",  "type": "float", "min": 0, "max": 1, "default": 0.5, "step": 0.01 },
+                        { "key": "sync_mode","label": "Sync Mode",  "type": "enum",  "options": ["Free", "Sync"], "default": 0 },
+                        { "key": "rec_length","label": "Rec Length", "type": "float", "min": 1, "max": 30, "default": 15, "step": 1, "unit": "sec" },
+                        { "key": "sync_div", "label": "Sync Div",   "type": "enum",  "options": ["1 Beat", "2 Beats", "1 Bar", "2 Bars", "4 Bars", "8 Bars", "16 Bars"], "default": 4 },
+                        { "key": "tempo",    "label": "Tempo",      "type": "int",   "min": 20, "max": 999, "default": 120, "step": 1, "unit": "BPM" }
                     ]
                 },
                 "Perform": {
@@ -151,6 +155,9 @@
             { "key": "eq_in",       "name": "Channel Mode",       "type": "enum",  "options": ["Input", "Tape", "Off"] },
             { "key": "rec_mode",    "name": "Rec Mode",    "type": "enum",  "options": ["Monitor", "Loop Only"] },
             { "key": "rec_length",  "name": "Rec Length",  "type": "float", "min": 1, "max": 30, "step": 1, "unit": "sec" },
+            { "key": "sync_mode",   "name": "Sync Mode",   "type": "enum",  "options": ["Free", "Sync"] },
+            { "key": "sync_div",    "name": "Sync Div",    "type": "enum",  "options": ["1 Beat", "2 Beats", "1 Bar", "2 Bars", "4 Bars", "8 Bars", "16 Bars"] },
+            { "key": "tempo",       "name": "Tempo",       "type": "int",   "min": 20, "max": 999, "step": 1, "unit": "BPM" },
             { "key": "fwd",         "name": "Fwd",         "type": "enum",  "options": ["Off", "On"] },
             { "key": "bwd",         "name": "Bwd",         "type": "enum",  "options": ["Off", "On"] },
             { "key": "load_a",      "name": "Load A",      "type": "filepath", "root": "/data/UserData/UserLibrary", "filter": ".wav", "live_preview": true, "default": "" },
