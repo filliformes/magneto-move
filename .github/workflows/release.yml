@@ -40,6 +40,7 @@ jobs:
               -I/repo/src/dsp \
               -lm
             cp /repo/src/module.json /repo/dist/magneto/
+            cp /repo/src/help.json /repo/dist/magneto/
             cd /repo && tar -czf dist/magneto-module.tar.gz -C dist magneto
           "
 

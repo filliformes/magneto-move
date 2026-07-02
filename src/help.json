@@ -1,0 +1,25 @@
+{
+  "title": "Magneto",
+  "sections": [
+    {
+      "title": "Overview",
+      "body": "Stereo cassette/tape looper + recorder. Records the audio flowing through its chain slot onto two 30 s tape sides (A/B), plays it back with tape character (wow, flutter, saturation, hiss, 9 machine voices) and a full performance surface. To loop external audio, put the stock Line In module (Stereo) in the synth slot before Magneto."
+    },
+    {
+      "title": "Quick start",
+      "body": "1) Magneto page: turn Rec to Rec, play your part, turn Rec back to Stopped - the loop closes and plays. 2) Rec again to overdub; Feedback (menu) sets how much old loop is kept. 3) Sweep Var Speed, flip Side, pick a Tape model. 4) Recordings > Save to Recs exports a WAV."
+    },
+    {
+      "title": "Menus",
+      "body": "Magneto: Play, Rec, Var Speed (+/-2 oct), Speed (1 7/8 - 15/16), Side A/B, Tone, Tape model, Volume. Menu: Feedback, Sync Mode, Rec Length, Sync Div, Tempo. Perform: Scrub jog, Jump, Scan (2nd playhead), Reverse, Stutter, Failure, Tape Stop + Stop Speed. Channel: Tascam-style strip (Trim, 3-band EQ, Pan, Volume; Channel Mode routes it to Input, Tape or Off). Tape Model: wow/flutter/saturation/rolloff/lowcut/hiss/generations, seeded per model. Deck: transport, fast-wind Fwd/Bwd, Clear, Pan Mode, Mix. Recordings: Rec Mode, Rec Length, Load/Blank A-B, Save to Recs, Recover Loop."
+    },
+    {
+      "title": "Sync",
+      "body": "Sync Mode Free = takes stop at Rec Length seconds. Sync = a fresh take auto-stops at an exact division (1 Beat to 16 Bars, default 4 Bars). With Move's MIDI Clock Out enabled and transport running the take locks to the clock ticks themselves; otherwise the manual Tempo (20-999 BPM) is used. 30 s per side: 2 Bars always fits, 4 Bars needs 32+ BPM, 8 Bars 64+, 16 Bars 128+."
+    },
+    {
+      "title": "Tips",
+      "body": "Overdub keeps the RAW old loop - tape colour is re-applied on playback, so layers never turn to mush; Feedback 100 = infinite sound-on-sound. Channel Mode = Tape lets you EQ/pan a loop after recording it. Scrub is a jog wheel: pitch follows your turn speed, works while stopped. Loops travel with the Set; if you swap Magneto out of a slot, Recordings > Recover Loop rescues the newest take from disk."
+    }
+  ]
+}

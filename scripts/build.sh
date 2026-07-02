@@ -18,6 +18,7 @@ CID=$(MSYS_NO_PATHCONV=1 docker create -w /build "$IMAGE" bash -c '
     aarch64-linux-gnu-gcc -O2 -shared -fPIC -ffast-math \
       -o /build/dist/magneto/magneto.so /build/src/dsp/*.c -I/build/src/dsp -lm
     cp /build/src/module.json /build/dist/magneto/
+    cp /build/src/help.json /build/dist/magneto/
     ls -la /build/dist/magneto/
 ')
 docker cp "$ROOT_WIN/src" "$CID:/build/src"
@@ -33,5 +34,6 @@ fi
 mkdir -p dist/magneto
 docker cp "$CID:/build/dist/magneto/magneto.so" "$ROOT_WIN/dist/magneto/"
 docker cp "$CID:/build/dist/magneto/module.json" "$ROOT_WIN/dist/magneto/"
+docker cp "$CID:/build/dist/magneto/help.json" "$ROOT_WIN/dist/magneto/"
 docker rm "$CID" >/dev/null
 echo "Built: dist/magneto/"
