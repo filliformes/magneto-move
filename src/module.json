@@ -99,7 +99,7 @@
                         { "key": "fwd",       "label": "Fwd",       "type": "enum",  "options": ["Off", "On"],          "default": 0 },
                         { "key": "bwd",       "label": "Bwd",       "type": "enum",  "options": ["Off", "On"],          "default": 0 },
                         { "key": "rec",       "label": "Rec",       "type": "enum",  "options": ["Stopped", "Rec"],     "default": 0 },
-                        { "key": "clear",     "label": "Clear",     "type": "enum",  "options": ["Clear", "Cleared"],  "default": 0 },
+                        { "key": "clear", "access": "write",     "label": "Clear",     "type": "enum",  "options": ["Clear", "Cleared"],  "default": 0 },
                         { "key": "input_pan", "label": "Pan",       "type": "float", "min": 0, "max": 1, "default": 0.5, "step": 0.01 },
                         { "key": "pan_mode",  "label": "Pan Mode",  "type": "enum",  "options": ["Mono", "Stereo"],    "default": 1 },
                         { "key": "mix",       "label": "Mix",       "type": "float", "min": 0, "max": 1, "default": 1.0, "step": 0.01 }
@@ -113,10 +113,10 @@
                         { "key": "rec_length","label": "Rec Length",  "type": "float", "min": 1, "max": 30, "default": 15, "step": 1, "unit": "sec" },
                         { "key": "load_a",    "label": "Load A",      "type": "filepath", "root": "/data/UserData/UserLibrary", "filter": ".wav", "live_preview": true, "default": "" },
                         { "key": "load_b",    "label": "Load B",      "type": "filepath", "root": "/data/UserData/UserLibrary", "filter": ".wav", "live_preview": true, "default": "" },
-                        { "key": "blank_a",   "label": "Blank A",     "type": "enum", "options": ["Blank", "Blanked"], "default": 0 },
-                        { "key": "blank_b",   "label": "Blank B",     "type": "enum", "options": ["Blank", "Blanked"], "default": 0 },
-                        { "key": "save_recs", "label": "Save to Recs","type": "enum", "options": ["Save", "Saved"], "default": 0 },
-                        { "key": "recover",   "label": "Recover Loop","type": "enum", "options": ["Recover", "Recovered"], "default": 0 }
+                        { "key": "blank_a", "access": "write",   "label": "Blank A",     "type": "enum", "options": ["Blank", "Blanked"], "default": 0 },
+                        { "key": "blank_b", "access": "write",   "label": "Blank B",     "type": "enum", "options": ["Blank", "Blanked"], "default": 0 },
+                        { "key": "save_recs", "access": "write", "label": "Save to Recs","type": "enum", "options": ["Save", "Saved"], "default": 0 },
+                        { "key": "recover", "access": "write",   "label": "Recover Loop","type": "enum", "options": ["Recover", "Recovered"], "default": 0 }
                     ]
                 }
             }
@@ -163,14 +163,14 @@
             { "key": "bwd",         "name": "Bwd",         "type": "enum",  "options": ["Off", "On"] },
             { "key": "load_a",      "name": "Load A",      "type": "filepath", "root": "/data/UserData/UserLibrary", "filter": ".wav", "live_preview": true, "default": "" },
             { "key": "load_b",      "name": "Load B",      "type": "filepath", "root": "/data/UserData/UserLibrary", "filter": ".wav", "live_preview": true, "default": "" },
-            { "key": "blank_a",     "name": "Blank A",     "type": "enum",  "options": ["Blank", "Blanked"] },
-            { "key": "blank_b",     "name": "Blank B",     "type": "enum",  "options": ["Blank", "Blanked"] },
-            { "key": "save_recs",   "name": "Save to Recs","type": "enum",  "options": ["Save", "Saved"] },
+            { "key": "blank_a", "access": "write",     "name": "Blank A",     "type": "enum",  "options": ["Blank", "Blanked"] },
+            { "key": "blank_b", "access": "write",     "name": "Blank B",     "type": "enum",  "options": ["Blank", "Blanked"] },
+            { "key": "save_recs", "access": "write",   "name": "Save to Recs","type": "enum",  "options": ["Save", "Saved"] },
             { "key": "play",        "name": "Play",        "type": "enum",  "options": ["Stopped", "Playing"] },
             { "key": "rec",         "name": "Rec",         "type": "enum",  "options": ["Stopped", "Rec"] },
             { "key": "reverse",     "name": "Reverse",     "type": "enum",  "options": ["Fwd", "Rev"] },
-            { "key": "clear",       "name": "Clear",       "type": "enum",  "options": ["Clear", "Cleared"] },
-            { "key": "recover",     "name": "Recover Loop","type": "enum",  "options": ["Recover", "Recovered"] }
+            { "key": "clear", "access": "write",       "name": "Clear",       "type": "enum",  "options": ["Clear", "Cleared"] },
+            { "key": "recover", "access": "write",     "name": "Recover Loop","type": "enum",  "options": ["Recover", "Recovered"] }
         ]
     }
 }
