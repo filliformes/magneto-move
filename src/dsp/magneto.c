@@ -1399,16 +1399,18 @@ static void set_param(void *instance, const char *key, const char *val) {
     if (!strcmp(key, "bwd"))  { p->bwd  = (!strcmp(val, "On")) ? 1 : (!strcmp(val, "Off")) ? 0 : (atoi(val) ? 1 : 0); return; }
     if (!strcmp(key, "tape_stop")) { p->tape_stop = (!strcmp(val, "On")) ? 1 : (!strcmp(val, "Off")) ? 0 : (atoi(val) ? 1 : 0); return; }
     if (!strcmp(key, "clear")) {
-        /* momentary: idle option "Clear" is a no-op; action option "Cleared" wipes the side */
-        if (!strcmp(val, "Clear")) return;
+        /* Momentary. Fire ONLY on the action spelling: this was "return if
+         * val is Clear", i.e. wipe on anything else -- so an INDEX write of
+         * "0", which MEANS "Clear", wiped the side and wrote the loop file. */
+        if (strcmp(val, "Cleared") != 0 && strcmp(val, "1") != 0) return;
         int s = clampi(p->side, 0, NUM_SIDES - 1);
         p->loop_len[s] = 0; p->write_pos = 0; p->play_pos = 0.0; p->rec = 0;
         save_loops(p);
         return;
     }
     if (!strcmp(key, "recover")) {
-        /* momentary: idle "Recover" no-op; "Recovered" scans disk for the newest loop */
-        if (!strcmp(val, "Recover")) return;
+        /* Momentary — fire only on the action spelling (see "clear"). */
+        if (strcmp(val, "Recovered") != 0 && strcmp(val, "1") != 0) return;
         recover_loop(p);
         return;
     }
@@ -1418,19 +1420,19 @@ static void set_param(void *instance, const char *key, const char *val) {
     if (!strcmp(key, "load_a")) { if (val[0]) load_wav_into_side(p, 0, val); return; }
     if (!strcmp(key, "load_b")) { if (val[0]) load_wav_into_side(p, 1, val); return; }
     if (!strcmp(key, "blank_a")) {
-        if (strcmp(val, "Blank") == 0) return;       /* idle option; "Blanked" fires */
+        if (strcmp(val, "Blanked") != 0 && strcmp(val, "1") != 0) return;  /* fire only */
         p->loop_len[0] = 0; p->load_path[0][0] = '\0';
         if (clampi(p->side,0,1) == 0) { p->play_pos = 0.0; p->write_pos = 0; p->rec = 0; }
         save_loops(p); return;
     }
     if (!strcmp(key, "blank_b")) {
-        if (strcmp(val, "Blank") == 0) return;
+        if (strcmp(val, "Blanked") != 0 && strcmp(val, "1") != 0) return;  /* fire only */
         p->loop_len[1] = 0; p->load_path[1][0] = '\0';
         if (clampi(p->side,0,1) == 1) { p->play_pos = 0.0; p->write_pos = 0; p->rec = 0; }
         save_loops(p); return;
     }
     if (!strcmp(key, "save_recs")) {
-        if (strcmp(val, "Save") == 0) return;        /* idle option; "Saved" fires */
+        if (strcmp(val, "Saved") != 0 && strcmp(val, "1") != 0) return;  /* fire only */
         export_wav(p, clampi(p->side, 0, NUM_SIDES - 1));   /* export the active side */
         return;
     }
