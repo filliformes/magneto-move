@@ -64,7 +64,7 @@
                 },
                 "Channel": {
                     "label": "Channel",
-                    "knobs": ["trim", "high", "high_freq", "mid_freq", "mid", "low", "input_pan", "chan_vol"],
+                    "knobs": ["trim", "low", "mid", "high", "mid_freq", "high_freq", "input_pan", "chan_vol"],
                     "params": [
                         { "key": "trim",      "label": "Trim",      "type": "float", "min": -12, "max": 12, "default": 0, "step": 0.5, "unit": "dB" },
                         { "key": "high",      "label": "High",      "type": "float", "min": -12, "max": 12, "default": 0, "step": 0.5, "unit": "dB" },

@@ -410,13 +410,22 @@ static const knob_def_t KNOB_MAP_PERF[8] = {       /* Page 1 — Perform */
     { "tape_stop", "Tape Stop", 0, 1, 1.0f,  1 },
     { "stop_speed","Stop Speed",60, 10000, 50.0f, 0 },
 };
-static const knob_def_t KNOB_MAP_CHAN[8] = {       /* Page 2 — Channel (Tascam strip, real units) */
+/* Page 2 — Channel (Tascam strip, real units).
+ * MUST stay in the same order as capabilities.ui_hierarchy.levels.Channel.knobs
+ * in module.json: that array drives the host's parameter-page grid, this table
+ * drives the knob_N_name / knob_N_value / knob_N_adjust overlay the host uses
+ * for a slot's global knob mapping. Both address the same physical knob, so a
+ * disagreement labels a knob one thing and adjusts another.
+ * The three band gains are adjacent and ascending so the host's EQ curve (which
+ * weights low at the left edge of the span and high at the right) agrees with
+ * the labels printed beneath it. */
+static const knob_def_t KNOB_MAP_CHAN[8] = {
     { "trim",      "Trim",      -12,    12,   0.5f,  0 },
-    { "high",      "High",      -12,    12,   0.5f,  0 },
-    { "high_freq", "High Freq", 5000,   12000, 50.0f, 0 },
-    { "mid_freq",  "Mid Freq",  250,    5000, 25.0f, 0 },
-    { "mid",       "Mid",       -12,    12,   0.5f,  0 },
     { "low",       "Low",       -12,    12,   0.5f,  0 },
+    { "mid",       "Mid",       -12,    12,   0.5f,  0 },
+    { "high",      "High",      -12,    12,   0.5f,  0 },
+    { "mid_freq",  "Mid Freq",  250,    5000, 25.0f, 0 },
+    { "high_freq", "High Freq", 5000,   12000, 50.0f, 0 },
     { "input_pan", "Pan",       0,      1,    0.01f, 0 },
     { "chan_vol",  "Volume",    0,      1,    0.01f, 0 },
 };
