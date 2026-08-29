@@ -27,7 +27,8 @@
                         { "level": "Tape",    "label": "Tape Model" },
                         { "level": "Deck",    "label": "Deck" },
                         { "level": "Recs",    "label": "Recordings" }
-                    ]
+                    ,
+                        { "key": "varspeed", "short_name": "VARI" }]
                 },
                 "Main": {
                     "label": "Magneto",
