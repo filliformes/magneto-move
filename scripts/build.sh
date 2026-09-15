@@ -16,7 +16,7 @@ CID=$(MSYS_NO_PATHCONV=1 docker create -w /build "$IMAGE" bash -c '
     dos2unix /build/src/dsp/*.c 2>/dev/null || true
     mkdir -p /build/dist/magneto
     aarch64-linux-gnu-gcc -O2 -shared -fPIC -ffast-math \
-      -o /build/dist/magneto/magneto.so /build/src/dsp/*.c -I/build/src/dsp -lm
+      -o /build/dist/magneto/magneto.so /build/src/dsp/*.c -I/build/src/dsp -lm -lpthread
     cp /build/src/module.json /build/dist/magneto/
     cp /build/src/help.json /build/dist/magneto/
     ls -la /build/dist/magneto/

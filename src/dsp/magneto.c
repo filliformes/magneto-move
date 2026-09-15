@@ -11,6 +11,7 @@
  * sound generator upstream (Input Mode: Stereo) to loop external audio.
  */
 
+#define _GNU_SOURCE            /* pthread_setaffinity_np / cpu_set_t (guarded, non-fatal if absent) */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -19,6 +20,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <pthread.h>           /* Wave 3: file I/O moved off the SPI audio callback to a worker */
+#include <sched.h>
+#include <signal.h>
 
 /* ── host_api_v1_t — MUST match chain_host ABI exactly (order + types) ─────────── */
 typedef int (*move_mod_emit_value_fn)(void *ctx, const char *source_id, const char *target,
@@ -75,6 +79,14 @@ static int g_next_instance = 1;   /* hands each instance an M-number for exporte
 #define RECS_DIR        "/data/UserData/UserLibrary/Magneto Recs"  /* exported WAVs land here */
 #define PATH_MAX_LEN    512
 #define FAST_RATE       8.0     /* Fwd/Bwd fast-wind playback rate (×) */
+
+/* ── Wave 3: worker-thread I/O request codes (bitmask in io_request) ───────────────
+ * Every module entry point runs on the SPI audio callback (SCHED_FIFO 70, core 3).
+ * File I/O is forbidden there, so the RT side only sets a request bit; a demoted
+ * SCHED_OTHER worker (cores 0–2) performs the fopen/fwrite/fread ~10 ms later. */
+#define IOREQ_SAVE      0x1     /* persist loops (worker reads loop[] directly, gen-guarded) */
+#define IOREQ_LOAD      0x2     /* state-restore reload of loop_id's loops */
+#define IOREQ_EXPORT    0x4     /* export active side to Magneto Recs as a WAV */
 
 /* Move transport / control CCs */
 #define CC_JOG_CLICK    3
@@ -385,6 +397,18 @@ typedef struct {
     int      rec_target_ticks;  /* division beats × 24 PPQN */
 
     char module_dir[512];
+
+    /* ── Wave 3: I/O worker thread (moves fopen/fwrite/fread off the audio callback) ──
+     * The RT side (on_midi/set_param) only sets io_request bits + a small captured
+     * argument; it never blocks and never does file I/O. save_gen[] is bumped by the RT
+     * thread on record-START so the worker can detect (and abort) a save whose loop
+     * buffer is being overwritten by a fresh record mid-write. */
+    pthread_t             io_thread;
+    int                   io_thread_running;    /* atomic: 1 = run, 0 = stop-and-exit */
+    volatile sig_atomic_t io_request;           /* bitmask of pending IOREQ_* ops */
+    volatile sig_atomic_t io_export_side;       /* side captured for a pending IOREQ_EXPORT */
+    int                   save_gen[NUM_SIDES];   /* atomic: ++ on record-START; worker aborts a torn save */
+    int                   io_thread_started;     /* 1 once pthread_create succeeded (for clean teardown) */
 } plugin_instance_t;
 
 /* ── Knob maps (page-aware overlay) ──────────────────────────────────────────────── */
@@ -510,7 +534,14 @@ static void apply_model(plugin_instance_t *p, int m) {
  * Loops are written to module_dir as files namespaced by the instance's loop_id.
  * The loop_id round-trips through the state string (get_param/set_param "state"), so a
  * saved Set recalls its own loops and concurrent instances never overwrite each other.
- * A blank instance gets a fresh id (no files yet) and starts empty. */
+ * A blank instance gets a fresh id (no files yet) and starts empty.
+ *
+ * WAVE 3 SCOPE: save_loops (deferred via IOREQ_SAVE / worker_save_loops) and load_loops
+ * (deferred via IOREQ_LOAD on the state-restore path) no longer run on the audio callback.
+ * The synchronous save_loops()/load_loops() below are retained ONLY for (a) the create-time
+ * load, (b) the destroy-time flush, and (c) the two still-synchronous P3 user actions that
+ * were NOT safely deferrable in one pass — recover_loop() and load_wav_into_side(). See the
+ * FLAG comments on those two functions. */
 static void gen_loop_id(char *out) {
     /* 64 bits of entropy from /dev/urandom → 16 hex chars; counter fallback. */
     static uint32_t fallback = 0x9E3779B9u;
@@ -554,7 +585,11 @@ static void load_loops(plugin_instance_t *p) {
     if (fscanf(m, "%d %d", &len[0], &len[1]) != 2) { len[0] = len[1] = 0; }
     fclose(m);
     for (int s = 0; s < NUM_SIDES; s++) {
-        p->loop_len[s] = 0;
+        /* Publish length 0 BEFORE overwriting the buffer: a concurrent process_block (this
+         * runs on the worker on the state-restore path) then treats the side as empty and
+         * never reads samples that are mid-fread. loop[s] is always MAX_FRAMES-allocated, so
+         * even a torn read stays in-bounds (a glitch, never a crash). */
+        __atomic_store_n(&p->loop_len[s], 0, __ATOMIC_RELEASE);
         len[s] = clampi(len[s], 0, MAX_FRAMES);
         if (len[s] <= 0) continue;
         loops_path(p, s, path, sizeof(path));
@@ -562,14 +597,55 @@ static void load_loops(plugin_instance_t *p) {
         if (!f) continue;
         size_t got = fread(p->loop[s], sizeof(int16_t), (size_t)len[s] * 2, f);
         fclose(f);
-        p->loop_len[s] = (int)(got / 2);
+        /* Release store: the fread'd samples are visible before the length that exposes them. */
+        __atomic_store_n(&p->loop_len[s], (int)(got / 2), __ATOMIC_RELEASE);
     }
+}
+
+/* Worker-thread save: same on-disk format as save_loops(), but reads the (post-record-STOP,
+ * stable) loop[] buffers directly on the SCHED_OTHER worker instead of the audio callback.
+ * Per side, snapshot save_gen before writing and re-check after: if a new record STARTed on
+ * that side mid-write (RT bumped save_gen), the .raw may be torn, so record length 0 for it
+ * and re-request a save — the next stable state persists it correctly. */
+static void worker_save_loops(plugin_instance_t *p) {
+    if (!p->module_dir[0] || !p->loop_id[0]) return;
+    char path[640];
+    int  saved_len[NUM_SIDES] = { 0, 0 };
+    for (int s = 0; s < NUM_SIDES; s++) {
+        int len = __atomic_load_n(&p->loop_len[s], __ATOMIC_ACQUIRE);
+        if (len <= 0) { saved_len[s] = 0; continue; }
+        int gen0 = __atomic_load_n(&p->save_gen[s], __ATOMIC_ACQUIRE);
+        loops_path(p, s, path, sizeof(path));
+        FILE *f = fopen(path, "wb");
+        if (!f) continue;
+        fwrite(p->loop[s], sizeof(int16_t), (size_t)len * 2, f);
+        fclose(f);
+        int gen1 = __atomic_load_n(&p->save_gen[s], __ATOMIC_ACQUIRE);
+        if (gen1 != gen0) {                 /* a fresh record started mid-write → torn; retry later */
+            saved_len[s] = 0;
+            __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE);
+        } else {
+            saved_len[s] = len;
+        }
+    }
+    snprintf(path, sizeof(path), "%s/magneto_%s.meta", p->module_dir, p->loop_id);
+    FILE *m = fopen(path, "w");
+    if (m) { fprintf(m, "%d %d\n", saved_len[0], saved_len[1]); fclose(m); }
 }
 
 /* Recover the most recently saved loop in module_dir, even if it was orphaned by an
  * accidental module swap (the loop_id link in the slot state is lost on swap, but the
  * .raw/.meta files survive). Scans for magneto_<id>.meta, picks the newest, adopts that
- * id, and reloads. Control-thread only (blocking dir + file I/O). */
+ * id, and reloads. Control-thread only (blocking dir + file I/O).
+ *
+ * WAVE 3 FLAG — STILL SYNCHRONOUS ON THE CALLBACK (P3, deferred, not shipped async):
+ * recover_loop() does opendir/readdir/stat/fopen to scan module_dir, then adopts a new
+ * loop_id and RESETS RT-owned transport state (loop_id, loop_len, play_pos, write_pos, rec)
+ * before calling load_loops(). Deferring it safely needs a two-phase "worker scans+stages →
+ * RT installs when ready" handoff (the loop_id + transport reset cannot be published from the
+ * worker without racing the audio thread). That could not be made provably safe in one pass,
+ * so per the Wave-3 spec it is left synchronous and flagged rather than shipped risky. It is a
+ * rare, explicit user action (Recover), almost always invoked while stopped. */
 #define META_NAME_LEN (8 + 16 + 5)   /* "magneto_" + 16 hex + ".meta" */
 static void recover_loop(plugin_instance_t *p) {
     if (!p->module_dir[0]) return;
@@ -611,7 +687,16 @@ static void recover_loop(plugin_instance_t *p) {
 /* ── Sample I/O ───────────────────────────────────────────────────────────────────────
  * Load any WAV (PCM 8/16/24/32 or float32, mono/stereo) into a tape side: decode →
  * resample to 44.1k → truncate to the tape length → int16 into loop[side]. Control-thread
- * only (blocking file I/O). Adapted from Granny's RIFF parser. */
+ * only (blocking file I/O). Adapted from Granny's RIFF parser.
+ *
+ * WAVE 3 FLAG — STILL SYNCHRONOUS ON THE CALLBACK (P3, deferred, not shipped async):
+ * load_wav_into_side() does fopen/fread + malloc/free (RIFF decode + resample scratch) and
+ * then installs the decoded samples straight into loop[side] AND mutates RT-owned transport
+ * state (loop_len[side], play_pos, write_pos, rec, load_path). A provably-safe async version
+ * needs a full-size staging buffer + pointer-swap-when-ready plus a transport-reset handoff to
+ * the RT thread — more than one pass, and it doubles the ~10 MB loop allocation. Per the
+ * Wave-3 spec ("do NOT ship a risky load path"), it is left synchronous and flagged. It is a
+ * user-initiated import (Recordings page), typically done while not performing. */
 static int load_wav_into_side(plugin_instance_t *p, int side, const char *path) {
     if (!path || !path[0]) return -1;
     side = clampi(side, 0, NUM_SIDES - 1);
@@ -699,7 +784,9 @@ static int load_wav_into_side(plugin_instance_t *p, int side, const char *path) 
     p->loop_len[side] = out_len;
     if (side == clampi(p->side, 0, NUM_SIDES - 1)) { p->play_pos = 0.0; p->write_pos = 0; p->rec = 0; }
     snprintf(p->load_path[side], PATH_MAX_LEN, "%s", path);
-    save_loops(p);   /* persist the imported audio + travel with the Set */
+    /* Persist the imported audio OFF the callback (buffer is stable after decode). The decode
+     * fread/malloc above still runs synchronously — see this function's WAVE 3 FLAG. */
+    __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -734,6 +821,45 @@ static void export_wav(plugin_instance_t *p, int side) {
     fwrite(h, 1, 44, f);
     fwrite(p->loop[side], sizeof(int16_t), (size_t)frames * 2, f);
     fclose(f);
+}
+
+/* ── Wave 3: I/O worker thread ──────────────────────────────────────────────────────
+ * Spawned at the end of create_instance, joined in destroy_instance. Demotes itself to
+ * SCHED_OTHER and pins to cores 0–2 FIRST (pthread_create inherits the caller's SCHED_FIFO
+ * 70, which would starve the audio thread). Then polls io_request every ~10 ms and performs
+ * the heavy file I/O (save/load/export) that used to run on the SPI audio callback. */
+static void *io_worker(void *arg) {
+    plugin_instance_t *p = (plugin_instance_t *)arg;
+
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));                       /* SCHED_OTHER priority 0 */
+    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+#ifdef __linux__
+    cpu_set_t cs; CPU_ZERO(&cs);
+    CPU_SET(0, &cs); CPU_SET(1, &cs); CPU_SET(2, &cs); /* cores 0–2 only — never core 3 (audio) */
+    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+#endif
+
+    while (__atomic_load_n(&p->io_thread_running, __ATOMIC_ACQUIRE)) {
+        int req = __atomic_load_n(&p->io_request, __ATOMIC_ACQUIRE);
+        /* Clear each bit BEFORE doing its work so a request arriving mid-write re-sets it
+         * and is picked up on the next poll (coalescing, latest-wins). */
+        if (req & IOREQ_LOAD) {
+            __atomic_fetch_and(&p->io_request, ~IOREQ_LOAD, __ATOMIC_ACQ_REL);
+            load_loops(p);
+        }
+        if (req & IOREQ_SAVE) {
+            __atomic_fetch_and(&p->io_request, ~IOREQ_SAVE, __ATOMIC_ACQ_REL);
+            worker_save_loops(p);
+        }
+        if (req & IOREQ_EXPORT) {
+            __atomic_fetch_and(&p->io_request, ~IOREQ_EXPORT, __ATOMIC_ACQ_REL);
+            export_wav(p, (int)p->io_export_side);
+        }
+        struct timespec ts = { 0, 10 * 1000 * 1000 };  /* ~10 ms poll */
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
 }
 
 /* ── Lifecycle ─────────────────────────────────────────────────────────────────────── */
@@ -787,7 +913,18 @@ static void *create_instance(const char *module_dir, const char *config_json) {
      * saved Set, Schwung calls set_param("state", ...) right after this with the saved id,
      * which reloads that id's loops. */
     gen_loop_id(p->loop_id);
-    load_loops(p);
+    load_loops(p);              /* create-time load — synchronous is fine (one-time, pre-audio) */
+
+    /* Spawn the I/O worker LAST, once every buffer/field is initialized. It demotes itself to
+     * SCHED_OTHER and pins cores 0–2 before doing any work (it inherits our SCHED_FIFO 70). */
+    __atomic_store_n(&p->io_thread_running, 1, __ATOMIC_RELEASE);
+    if (pthread_create(&p->io_thread, NULL, io_worker, p) == 0) {
+        p->io_thread_started = 1;
+    } else {
+        p->io_thread_started = 0;
+        __atomic_store_n(&p->io_thread_running, 0, __ATOMIC_RELEASE);
+        if (g_host && g_host->log) g_host->log("[magneto] WARN: io worker spawn failed; I/O flushes on destroy");
+    }
 
     if (g_host && g_host->log) g_host->log("[magneto] instance created");
     return p;
@@ -796,6 +933,13 @@ static void *create_instance(const char *module_dir, const char *config_json) {
 static void destroy_instance(void *instance) {
     plugin_instance_t *p = (plugin_instance_t *)instance;
     if (!p) return;
+    /* Stop + JOIN the worker before touching shared state or freeing buffers (never detach). */
+    if (p->io_thread_started) {
+        __atomic_store_n(&p->io_thread_running, 0, __ATOMIC_RELEASE);
+        pthread_join(p->io_thread, NULL);
+    }
+    /* Final synchronous flush — teardown is load-time, so one blocking write is acceptable and
+     * guarantees a Save / record-stop made just before unload isn't lost. Single-threaded now. */
     save_loops(p);
     for (int s = 0; s < NUM_SIDES; s++) free(p->loop[s]);
     free(p);
@@ -814,6 +958,9 @@ static void toggle_play(plugin_instance_t *p) {
 static void toggle_record(plugin_instance_t *p) {
     int s = clampi(p->side, 0, NUM_SIDES - 1);
     if (!p->rec) {
+        /* Record START: bump this side's generation so the worker can detect (and abort) a
+         * save whose loop buffer this fresh take is about to overwrite mid-write. */
+        __atomic_fetch_add(&p->save_gen[s], 1, __ATOMIC_ACQ_REL);
         p->rec = 1;
         p->rec_tick_lock = 0;
         if (p->loop_len[s] == 0) {
@@ -835,7 +982,9 @@ static void toggle_record(plugin_instance_t *p) {
         }
         p->rec = 0;
         p->rec_tick_lock = 0;
-        save_loops(p);   /* persist the finished take immediately (not the audio thread) */
+        /* Persist the finished take — but OFF the audio callback. The buffer is stable now
+         * (rec just cleared), so the worker reads loop[s] directly ~10 ms later. */
+        __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE);
     }
 }
 
@@ -1383,7 +1532,7 @@ static void set_param(void *instance, const char *key, const char *val) {
                     if (w && !p->rec) toggle_record(p); else if (!w && p->rec) toggle_record(p);
                 }
                 else if (!strcmp(k->key, "clear")) {
-                    if (delta > 0) { int sd = clampi(p->side,0,NUM_SIDES-1); p->loop_len[sd]=0; p->write_pos=0; p->play_pos=0.0; p->rec=0; save_loops(p); }
+                    if (delta > 0) { int sd = clampi(p->side,0,NUM_SIDES-1); p->loop_len[sd]=0; p->write_pos=0; p->play_pos=0.0; p->rec=0; __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE); }
                 }
             } else {
                 float *f = float_param(p, k->key);
@@ -1418,7 +1567,7 @@ static void set_param(void *instance, const char *key, const char *val) {
         if (!strcmp(val, "Clear")) return;
         int s = clampi(p->side, 0, NUM_SIDES - 1);
         p->loop_len[s] = 0; p->write_pos = 0; p->play_pos = 0.0; p->rec = 0;
-        save_loops(p);
+        __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE);
         return;
     }
     if (!strcmp(key, "recover")) {
@@ -1427,7 +1576,7 @@ static void set_param(void *instance, const char *key, const char *val) {
         recover_loop(p);
         return;
     }
-    if (!strcmp(key, "save"))    { save_loops(p); return; }
+    if (!strcmp(key, "save"))    { __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE); return; }
 
     /* Recordings page — load WAV into a side, blank a side, export to Magneto Recs */
     if (!strcmp(key, "load_a")) { if (val[0]) load_wav_into_side(p, 0, val); return; }
@@ -1436,17 +1585,21 @@ static void set_param(void *instance, const char *key, const char *val) {
         if (strcmp(val, "Blank") == 0) return;       /* idle option; "Blanked" fires */
         p->loop_len[0] = 0; p->load_path[0][0] = '\0';
         if (clampi(p->side,0,1) == 0) { p->play_pos = 0.0; p->write_pos = 0; p->rec = 0; }
-        save_loops(p); return;
+        __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE); return;
     }
     if (!strcmp(key, "blank_b")) {
         if (strcmp(val, "Blank") == 0) return;
         p->loop_len[1] = 0; p->load_path[1][0] = '\0';
         if (clampi(p->side,0,1) == 1) { p->play_pos = 0.0; p->write_pos = 0; p->rec = 0; }
-        save_loops(p); return;
+        __atomic_fetch_or(&p->io_request, IOREQ_SAVE, __ATOMIC_RELEASE); return;
     }
     if (!strcmp(key, "save_recs")) {
         if (strcmp(val, "Save") == 0) return;        /* idle option; "Saved" fires */
-        export_wav(p, clampi(p->side, 0, NUM_SIDES - 1));   /* export the active side */
+        /* Export the active side OFF the callback (multi-MB fwrite). export_wav only READS
+         * loop[side] + writes a new WAV — no RT-owned state is mutated, so this is safe to
+         * defer as-is; capture the side, then request. */
+        p->io_export_side = (sig_atomic_t)clampi(p->side, 0, NUM_SIDES - 1);
+        __atomic_fetch_or(&p->io_request, IOREQ_EXPORT, __ATOMIC_RELEASE);
         return;
     }
 
@@ -1548,7 +1701,10 @@ static void set_param(void *instance, const char *key, const char *val) {
                    ((idp[n] >= '0' && idp[n] <= '9') || (idp[n] >= 'a' && idp[n] <= 'f'))) {
                 p->loop_id[n] = idp[n]; n++;
             }
-            if (n > 0) { p->loop_id[n] = '\0'; load_loops(p); }
+            /* P2: reload this id's loops OFF the callback. loop_id is fully written above;
+             * the release on io_request publishes it to the worker, which reads the .meta/.raw
+             * and installs the samples with a length-published-last ordering (load_loops). */
+            if (n > 0) { p->loop_id[n] = '\0'; __atomic_fetch_or(&p->io_request, IOREQ_LOAD, __ATOMIC_RELEASE); }
         }
         return;
     }
