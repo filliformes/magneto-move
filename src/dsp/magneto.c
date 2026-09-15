@@ -1331,6 +1331,21 @@ static void process_block(void *instance, int16_t *buf, int frames) {
 }
 
 /* ── Parameters ──────────────────────────────────────────────────────────────────── */
+/* Find "<field>=" in a ';'-separated key=value state string, matching only a WHOLE field:
+ * the match must start the string or follow a ';', and be immediately followed by '='.
+ * Returns a pointer just past the '=' (start of the value), or NULL. This makes the id
+ * parse unambiguous — a bare strstr(val,"id=") could latch onto "id=" appearing inside
+ * another token/value, whereas this only matches the real, delimited "id=" field. */
+static const char *state_field(const char *s, const char *field) {
+    size_t flen = strlen(field);
+    const char *p = s;
+    while ((p = strstr(p, field)) != NULL) {
+        if ((p == s || p[-1] == ';') && p[flen] == '=') return p + flen + 1;
+        p += 1;
+    }
+    return NULL;
+}
+
 static void set_param(void *instance, const char *key, const char *val) {
     plugin_instance_t *p = (plugin_instance_t *)instance;
     if (!p || !key || !val) return;
@@ -1517,14 +1532,17 @@ static void set_param(void *instance, const char *key, const char *val) {
           if ((q = strstr(val, "sync_mode="))   ) p->sync_mode   = clampi(atoi(q + 10), 0, 1);
           if ((q = strstr(val, "sync_div="))    ) p->sync_div    = clampi(atoi(q + 9), 0, NUM_DIV - 1);
           if ((q = strstr(val, "tempo="))       ) p->tempo_bpm   = clampi(atoi(q + 6), 20, 999);
+          /* reverse is a LATCHING playback-direction mode → persists with the Set */
+          if ((q = state_field(val, "reverse"))  ) p->reverse     = clampi(atoi(q), 0, 1);
         }
         p->pan_mode = clampi(pm, 0, NUM_PANMODE - 1);
 
         /* Restore the saved loop id and reload its loops (this is how a saved Set recalls
-         * what was recorded). Parsed separately so a missing id leaves this blank. */
-        const char *idp = strstr(val, "id=");
+         * what was recorded). Matched as a WHOLE, ';'-delimited field so it can never latch
+         * onto an "id=" substring elsewhere in the string — this is what lets load_loops()
+         * find magneto_<realid>.meta and bring the recorded loops back with the Set. */
+        const char *idp = state_field(val, "id");
         if (idp) {
-            idp += 3;
             int n = 0;
             while (n < LOOP_ID_LEN - 1 && idp[n] &&
                    ((idp[n] >= '0' && idp[n] <= '9') || (idp[n] >= 'a' && idp[n] <= 'f'))) {
@@ -1621,13 +1639,13 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
             "lowcut=%.6f;generations=%.6f;input_pan=%.6f;pan_mode=%d;stutter=%.6f;failure=%.6f;"
             "trim=%.6f;low=%.6f;mid=%.6f;mid_freq=%.6f;high=%.6f;high_freq=%.6f;chan_vol=%.6f;"
             "jump=%.6f;scan=%.6f;stop_speed=%.6f;rec_length=%.6f;eq_in=%d;rec_mode=%d;"
-            "sync_mode=%d;sync_div=%d;tempo=%d;id=%s",
+            "sync_mode=%d;sync_div=%d;tempo=%d;reverse=%d;id=%s",
             p->varspeed, p->speed_mode, p->side, p->tone, p->volume, p->model, p->mix, p->feedback,
             p->wow, p->flutter, p->saturation, p->rolloff, p->hiss,
             p->lowcut, p->generations, p->input_pan, p->pan_mode, p->stutter, p->failure,
             p->trim, p->low, p->mid, p->mid_freq, p->high, p->high_freq, p->chan_vol,
             p->jump, p->scan, p->stop_speed, p->rec_length, p->eq_in, p->rec_mode,
-            p->sync_mode, p->sync_div, p->tempo_bpm, p->loop_id);
+            p->sync_mode, p->sync_div, p->tempo_bpm, p->reverse, p->loop_id);
     }
 
     return -1;   /* unknown key — MUST be -1, not 0 */
